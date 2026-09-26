@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from contextlib import suppress
 from dataclasses import dataclass
 from uuid import UUID
 
@@ -64,8 +63,8 @@ class IntegrityManager:
         self.metadata = MetadataManager(session)
         self.client_factory = client_factory
         self.repair_manager_factory = repair_manager_factory
-        self.replication_factor = settings.replication_factor if replication_factor is None else replication_factor
-        max_attempts = settings.max_attempts if max_attempts is None else max_attempts
+        self.replication_factor = replication_factor
+        self.max_attempts = max_attempts
         if max_attempts < 1:
             raise ValueError("max_attempts must be positive")
         self.max_attempts = max_attempts
@@ -182,8 +181,7 @@ class IntegrityManager:
                 size_bytes=actual_size,
             )
         finally:
-            with suppress(Exception):
-                await client.aclose()
+            await client.aclose()
 
     def create_job(self, *, node_id: str | None = None, version_id: UUID | None = None) -> IntegrityJob:
         if node_id is not None:
