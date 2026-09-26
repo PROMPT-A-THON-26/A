@@ -2,18 +2,24 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
+from sqlalchemy import select
 
 from common.constants import NodeState
 from common.settings import settings
+from common.ids import normalize_request_id
+from common.rate_limit import SlidingWindowRateLimiter
 from gateway.api import build_gateway_router
+from replication.node_client import StorageNodeClient, StorageNodeClientError
 from metadata.database import create_schema, session_scope
 from metadata.manager import MetadataManager
+from metadata.models import StorageNode
 from replication import ReplicationPolicy
 
 
@@ -41,26 +47,71 @@ def _parse_storage_nodes() -> list[tuple[str, str]]:
     return nodes
 
 
-def _bootstrap_nodes() -> None:
+async def _verify_storage_node(
+    node_id: str,
+    address: str,
+) -> tuple[str, str, int] | None:
+    """Verify a fresh node before allowing it to enter HEALTHY state."""
+    client = StorageNodeClient(
+        address,
+        timeout_seconds=settings.storage_request_timeout_seconds,
+    )
+    try:
+        health, stats = await asyncio.gather(client.health(), client.stats())
+        if health.node_id != node_id or health.status.lower() != "healthy":
+            return None
+        return node_id, address, stats.capacity_bytes
+    except StorageNodeClientError:
+        return None
+    finally:
+        await client.aclose()
+
+
+async def _bootstrap_nodes() -> None:
     create_schema()
-    capacity = int(os.getenv("VAULT_NODE_CAPACITY_BYTES", str(10 * 1024**3)))
+    configured_capacity = int(
+        os.getenv("VAULT_NODE_CAPACITY_BYTES", str(10 * 1024**3))
+    )
+    configured_nodes = _parse_storage_nodes()
+    verified = await asyncio.gather(
+        *(_verify_storage_node(node_id, address) for node_id, address in configured_nodes)
+    )
+    verified_by_id = {
+        node_id: (address, capacity)
+        for result in verified
+        if result is not None
+        for node_id, address, capacity in [result]
+    }
+
     with session_scope() as session:
         manager = MetadataManager(session)
-        for node_id, address in _parse_storage_nodes():
+        for node_id, address in configured_nodes:
+            existing = session.scalar(
+                select(StorageNode).where(StorageNode.address == address)
+            )
+            if existing is not None:
+                continue
+            verified_result = verified_by_id.get(node_id)
             manager.register_node(
                 node_id=node_id,
                 address=address,
-                capacity_bytes=capacity,
-                # Nodes enter JOINING until a real storage-node heartbeat is
-                # accepted by the health service. Never assert HEALTHY at bootstrap.
-                status=NodeState.JOINING,
+                capacity_bytes=(
+                    verified_result[1] if verified_result is not None else configured_capacity
+                ),
+                # A new node is HEALTHY only after the storage-node API has
+                # been contacted and its identity/status/capacity verified.
+                status=(
+                    NodeState.HEALTHY
+                    if verified_result is not None
+                    else NodeState.JOINING
+                ),
             )
         session.commit()
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    _bootstrap_nodes()
+    await _bootstrap_nodes()
     yield
 
 
@@ -84,12 +135,43 @@ app.add_middleware(
     allow_headers=["Accept", "Content-Type", "X-Expected-Version", "X-Request-ID"],
 )
 
+rate_limiter = SlidingWindowRateLimiter(
+    limit=int(os.getenv("RATE_LIMIT_PER_MINUTE", "240")),
+    window_seconds=60.0,
+)
+
 app.include_router(
     build_gateway_router(
         session_scope,
         replication_policy=ReplicationPolicy.from_settings(),
     )
 )
+
+
+@app.middleware("http")
+async def rate_limit_requests(request: Request, call_next) -> Response:
+    if request.url.path.startswith("/api/v1/") and request.url.path != "/api/v1/health":
+        client_key = request.client.host if request.client is not None else "unknown"
+        allowed, retry_after = rate_limiter.allow(client_key)
+        if not allowed:
+            request_id = normalize_request_id(request.headers.get("X-Request-ID"))
+            response = JSONResponse(
+                status_code=429,
+                content={
+                    "error": {
+                        "code": "RATE_LIMITED",
+                        "message": "Request rate limit exceeded.",
+                        "request_id": request_id,
+                    }
+                },
+                headers={
+                    "Retry-After": str(retry_after),
+                    "X-Request-ID": request_id,
+                    "Cache-Control": "no-store",
+                },
+            )
+            return response
+    return await call_next(request)
 
 
 @app.middleware("http")
