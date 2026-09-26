@@ -18,7 +18,7 @@ from urllib.parse import quote, urlparse
 
 import httpx
 
-from common.ids import new_request_id
+from common.ids import new_request_id, validate_request_id
 from common.settings import settings
 
 
@@ -186,6 +186,8 @@ class StorageNodeClientConfig:
         parsed = urlparse(address)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValueError("storage-node address must be an absolute http(s) URL")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("storage-node address must not contain embedded credentials")
         object.__setattr__(self, "address", address)
 
         if self.timeout_seconds is not None and self.timeout_seconds <= 0:
@@ -809,9 +811,7 @@ class StorageNodeClient:
     def _request_id(request_id: str | None) -> str:
         if request_id is None:
             return new_request_id()
-        if not isinstance(request_id, str) or not request_id.strip():
-            raise ValueError("request_id must be a non-empty string when supplied")
-        return request_id.strip()
+        return validate_request_id(request_id)
 
     @staticmethod
     def _headers(
