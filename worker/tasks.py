@@ -7,7 +7,8 @@ from typing import Any
 from uuid import UUID
 
 from celery import Task
-from sqlalchemy import func, select
+from pydantic import ValidationError
+from sqlalchemy import and_, func, select
 
 from common.constants import ErrorCode, NodeState, ReplicaState, VersionState
 from common.errors import VaultError
@@ -154,23 +155,26 @@ def check_under_replicated_objects(self: Task) -> dict[str, Any]:
         queued = []
         blocked = []
         with session_scope() as session:
-            versions = list(
-                session.scalars(
-                    select(Version).where(Version.state == VersionState.COMMITTED)
-                ).all()
-            )
-            for version in versions:
-                healthy_count = int(
-                    session.scalar(
-                        select(func.count(Replica.replica_id)).where(
-                            Replica.version_id == version.version_id,
-                            Replica.status == ReplicaState.HEALTHY,
-                        )
-                    )
-                    or 0
+            under_replicated = session.execute(
+                select(
+                    Version,
+                    func.count(Replica.replica_id).label("healthy_count"),
                 )
-                if healthy_count >= settings.replication_factor:
-                    continue
+                .outerjoin(
+                    Replica,
+                    and_(
+                        Replica.version_id == Version.version_id,
+                        Replica.status == ReplicaState.HEALTHY,
+                    ),
+                )
+                .where(Version.state == VersionState.COMMITTED)
+                .group_by(Version.version_id)
+                .having(func.count(Replica.replica_id) < settings.replication_factor)
+                .order_by(Version.version_id)
+            ).all()
+
+            for version, healthy_count in under_replicated:
+                healthy_count = int(healthy_count)
                 try:
                     job = RepairManager(
                         session,
@@ -301,41 +305,59 @@ def process_node_health(self: Task) -> dict[str, Any]:
                 ).all()
             )
 
-            async def poll_nodes() -> None:
-                for node in nodes:
-                    client = StorageNodeClient(
-                        node.address,
-                        timeout_seconds=settings.storage_request_timeout_seconds,
+            async def poll_node(node: StorageNode) -> tuple[StorageNode, HeartbeatPayload | None, str | None]:
+                client = StorageNodeClient(
+                    node.address,
+                    timeout_seconds=settings.storage_request_timeout_seconds,
+                )
+                try:
+                    health, stats = await asyncio.gather(
+                        client.health(),
+                        client.stats(),
                     )
-                    try:
-                        health = await client.health()
-                        stats = await client.stats()
-                        if health.node_id != node.node_id or health.status.lower() != "healthy":
-                            raise StorageNodeClientError(
-                                "Storage node health response is not healthy or has mismatched identity."
-                            )
-                        payload = HeartbeatPayload(
+                    if (
+                        health.node_id != node.node_id
+                        or health.status.lower() != "healthy"
+                    ):
+                        raise StorageNodeClientError(
+                            "Storage node health response is not healthy or has mismatched identity."
+                        )
+                    return (
+                        node,
+                        HeartbeatPayload(
                             node_id=node.node_id,
                             capacity_bytes=stats.capacity_bytes,
                             used_bytes=stats.used_bytes,
                             timestamp=datetime.now(timezone.utc),
-                        )
-                        result = (
-                            await heartbeat_service.ingest_and_recover(payload)
-                            if node.status is NodeState.UNAVAILABLE
-                            else heartbeat_service.ingest(payload)
-                        )
-                        transitions.append({
-                            "node_id": node.node_id,
-                            "status": result.status.value,
-                            "accepted": result.accepted,
-                        })
-                    except Exception as exc:
-                        poll_failures.append({"node_id": node.node_id, "error": str(exc)})
-                    finally:
-                        await client.aclose()
+                        ),
+                        None,
+                    )
+                except (StorageNodeClientError, ValidationError) as exc:
+                    return node, None, str(exc)
+                finally:
+                    await client.aclose()
 
-            _run_async(poll_nodes())
+            async def poll_nodes() -> list[tuple[StorageNode, HeartbeatPayload | None, str | None]]:
+                return list(
+                    await asyncio.gather(
+                        *(poll_node(node) for node in nodes),
+                    )
+                )
+
+            for node, payload, error in _run_async(poll_nodes()):
+                if error is not None or payload is None:
+                    poll_failures.append({"node_id": node.node_id, "error": error or "heartbeat payload unavailable"})
+                    continue
+                result = (
+                    _run_async(heartbeat_service.ingest_and_recover(payload))
+                    if node.status is NodeState.UNAVAILABLE
+                    else heartbeat_service.ingest(payload)
+                )
+                transitions.append({
+                    "node_id": node.node_id,
+                    "status": result.status.value,
+                    "accepted": result.accepted,
+                })
 
             detector = FailureDetector(
                 session,
