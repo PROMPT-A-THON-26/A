@@ -331,7 +331,7 @@
   let activeOverlay=null;
   let restoreFocus=null;
   const FOCUSABLE_SELECTOR='a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])';
-  function focusables(container){return $(FOCUSABLE_SELECTOR,container).filter(el=>!el.hidden&&el.offsetParent!==null);}
+  function focusables(container){return $$(FOCUSABLE_SELECTOR,container).filter(el=>!el.hidden&&el.offsetParent!==null);}
   function openOverlay(id,initialSelector){
     const overlay=$("#"+id);
     if(!overlay)return;
