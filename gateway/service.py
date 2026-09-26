@@ -7,11 +7,11 @@ import hashlib
 import os
 import tempfile
 from collections.abc import AsyncIterable
-from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from common.constants import (
@@ -22,6 +22,7 @@ from common.constants import (
     ReplicaState,
     VersionState,
 )
+from common.validation import normalize_object_name
 from common.errors import (
     ObjectAlreadyExists,
     ObjectNotFound,
@@ -57,17 +58,16 @@ class GatewayService:
         )
 
     def get_object(self, name: str) -> Object:
-        if not isinstance(name, str) or not name.strip():
-            raise ValueError("object name must not be empty")
-        obj = self.session.scalar(select(Object).where(Object.name == name.strip()))
+        normalized_name = normalize_object_name(name)
+        obj = self.session.scalar(select(Object).where(Object.name == normalized_name))
         if obj is None:
-            raise ObjectNotFound(name.strip())
+            raise ObjectNotFound(normalized_name)
         return obj
 
     def get_live_object(self, name: str) -> Object:
         obj = self.get_object(name)
         if obj.state is not ObjectState.ACTIVE:
-            raise ObjectNotFound(name.strip())
+            raise ObjectNotFound(obj.name)
         return obj
 
     def object_metadata(self, name: str) -> dict:
@@ -177,7 +177,7 @@ class GatewayService:
     def read_targets(self, name: str) -> tuple[Object, Version, list[StorageNode]]:
         obj, version = self.head(name)
         if version is None:
-            raise ObjectNotFound(name.strip())
+            raise ObjectNotFound(obj.name)
         targets = list(
             self.session.scalars(
                 select(StorageNode)
@@ -196,7 +196,7 @@ class GatewayService:
         if not targets:
             raise VaultError(
                 code=ErrorCode.NODE_UNAVAILABLE,
-                message=f"No healthy replica is available for object '{name.strip()}'.",
+                message=f"No healthy replica is available for object '{obj.name}'.",
                 status_code=503,
             )
         return obj, version, targets
@@ -207,6 +207,7 @@ class GatewayService:
         path = Path(temp_name)
         size = 0
         digest = hashlib.sha256()
+        completed = False
         try:
             with os.fdopen(fd, "wb") as handle:
                 async for chunk in chunks:
@@ -220,10 +221,11 @@ class GatewayService:
                     await asyncio.to_thread(handle.write, data)
                 await asyncio.to_thread(handle.flush)
                 await asyncio.to_thread(os.fsync, handle.fileno())
+            completed = True
             return StagedUpload(path=path, size_bytes=size, checksum=digest.hexdigest())
-        except Exception:
-            path.unlink(missing_ok=True)
-            raise
+        finally:
+            if not completed:
+                path.unlink(missing_ok=True)
 
     @staticmethod
     async def file_chunks(
@@ -249,22 +251,22 @@ class GatewayService:
         replication_policy: ReplicationPolicy | None = None,
         client_factory=StorageNodeClient,
     ) -> dict:
-        if not isinstance(name, str) or not name.strip():
-            raise ValueError("object name must not be empty")
+        normalized_name = normalize_object_name(name)
 
         staged = await self.stage_upload(chunks)
         created_object = False
         version = None
+        succeeded = False
         try:
             obj = self.session.scalar(
-                select(Object).where(Object.name == name.strip())
+                select(Object).where(Object.name == normalized_name)
             )
             if obj is None:
                 try:
-                    obj = self.metadata.create_object(name)
+                    obj = self.metadata.create_object(normalized_name)
                     created_object = True
                 except ObjectAlreadyExists:
-                    obj = self.get_object(name)
+                    obj = self.get_object(normalized_name)
 
             version = self.metadata.create_version(
                 obj.object_id,
@@ -293,6 +295,7 @@ class GatewayService:
             # The request session is intentionally not auto-committing. Persist
             # the successful metadata transaction before returning the response.
             self.session.commit()
+            succeeded = True
             return {
                 "object_id": str(obj.object_id),
                 "name": obj.name,
@@ -304,16 +307,19 @@ class GatewayService:
                 "replication_factor": policy.factor,
                 "write_quorum": policy.write_quorum,
             }
-        except Exception:
-            if version is not None and version.state is VersionState.PREPARING:
-                with suppress(Exception):
-                    self.metadata.fail_version(version.version_id)
-            if created_object and "obj" in locals() and obj.current_version_id is None:
-                with suppress(Exception):
-                    self.session.delete(obj)
-                    self.session.commit()
-            raise
         finally:
+            if not succeeded:
+                if version is not None and version.state is VersionState.PREPARING:
+                    try:
+                        self.metadata.fail_version(version.version_id)
+                    except VaultError:
+                        pass
+                if created_object and "obj" in locals() and obj.current_version_id is None:
+                    try:
+                        self.session.delete(obj)
+                        self.session.commit()
+                    except SQLAlchemyError:
+                        self.session.rollback()
             staged.path.unlink(missing_ok=True)
 
     async def delete_object(
@@ -369,7 +375,7 @@ class GatewayService:
         self.session.commit()
         if failures:
             raise VaultError(
-                code=__import__("common.constants", fromlist=["ErrorCode"]).ErrorCode.NODE_UNAVAILABLE,
+                code=ErrorCode.NODE_UNAVAILABLE,
                 message=f"Unable to delete replicas on nodes: {', '.join(failures)}",
                 status_code=503,
             )
@@ -397,7 +403,7 @@ class GatewayService:
             finally:
                 await client.aclose()
         raise VaultError(
-            code=__import__("common.constants", fromlist=["ErrorCode"]).ErrorCode.NODE_UNAVAILABLE,
+            code=ErrorCode.NODE_UNAVAILABLE,
             message="No healthy replica could be contacted for the requested object.",
             status_code=503,
         )
