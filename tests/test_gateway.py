@@ -11,6 +11,7 @@ from httpx import ASGITransport
 from common.constants import NodeState, ObjectState, VersionState
 from common.errors import VersionConflict
 from gateway.api import build_gateway_router
+from gateway.service import GatewayService
 from metadata.manager import MetadataManager
 from replication.node_client import (
     StorageObjectAlreadyExistsError,
@@ -262,3 +263,22 @@ async def test_gateway_head_exposes_committed_version_metadata(db_session):
     assert response.headers["content-length"] == "5"
     assert response.headers["x-version-number"] == "1"
     assert response.headers["x-checksum-sha256"] == sha256(b"hello").hexdigest()
+
+
+def test_gateway_health_reports_degraded_until_all_registered_nodes_are_healthy(db_session):
+    manager = MetadataManager(db_session)
+    manager.register_node(
+        node_id="joining-node",
+        address="http://joining-node:9001",
+        capacity_bytes=10_000,
+        status=NodeState.JOINING,
+    )
+    manager.register_node(
+        node_id="healthy-node",
+        address="http://healthy-node:9001",
+        capacity_bytes=10_000,
+        status=NodeState.HEALTHY,
+    )
+    health = GatewayService(db_session).health()
+    assert health["status"] == "degraded"
+    assert health["nodes"] == 2
